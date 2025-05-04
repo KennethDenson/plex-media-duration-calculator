@@ -5,6 +5,13 @@ import configparser
 import os
 import sys
 from datetime import timedelta
+from collections import defaultdict
+import shutil
+try:
+    from tabulate import tabulate
+    TABULATE_AVAILABLE = True
+except ImportError:
+    TABULATE_AVAILABLE = False
 
 class PlexMediaCalculator:
     def __init__(self, server_url=None, token=None, config_file="plex_config.ini"):
@@ -12,17 +19,14 @@ class PlexMediaCalculator:
         self.server_url = server_url
         self.token = token
         self.total_duration = 0  # duration in milliseconds
-        self.media_counts = {
-            "movies": 0,
-            "episodes": 0,
-            "tracks": 0,
-            "other": 0
-        }
-        
+        self.group_by = "type"  # default grouping
+        self.media_counts = defaultdict(int)
+        self.library_stats = defaultdict(lambda: {"count": 0, "duration": 0, "type": None})
         # Load configuration if not provided
         if not server_url or not token:
             self.load_config()
-            
+        self.load_group_by()
+        
     def load_config(self):
         """Load Plex server URL and token from config file"""
         if os.path.exists(self.config_file):
@@ -62,6 +66,31 @@ class PlexMediaCalculator:
         print(f"Configuration saved to {self.config_file}")
         self.server_url = server_url
         self.token = token
+    
+    def load_group_by(self):
+        """Load or prompt for group_by option and store in config"""
+        config = configparser.ConfigParser()
+        config.read(self.config_file)
+        last_group_by = None
+        if "OUTPUT" in config and "group_by" in config["OUTPUT"]:
+            last_group_by = config["OUTPUT"]["group_by"].strip().lower()
+        prompt = "How would you like to group your media summary? (type/name)"
+        if last_group_by:
+            prompt += f" [default: {last_group_by}]"
+        prompt += ": "
+        user_input = input(prompt).strip().lower()
+        if user_input not in ("type", "name", ""):
+            print("Invalid input. Defaulting to last used or 'type'.")
+            user_input = last_group_by or "type"
+        if user_input == "":
+            user_input = last_group_by or "type"
+        self.group_by = user_input
+        # Save to config
+        if "OUTPUT" not in config:
+            config["OUTPUT"] = {}
+        config["OUTPUT"]["group_by"] = self.group_by
+        with open(self.config_file, "w") as f:
+            config.write(f)
     
     def make_request(self, endpoint):
         """Make a request to the Plex API"""
@@ -114,16 +143,19 @@ class PlexMediaCalculator:
                 section_duration += duration
                 section_count += 1
                 self.media_counts["movies"] += 1
+                self.library_stats[section_title]["count"] += 1
+                self.library_stats[section_title]["duration"] += duration
+                self.library_stats[section_title]["type"] = section_type
                 
             elif section_type == "show":
                 # For shows, we need to get all episodes
                 show_key = item.get("key")
-                self.process_show(show_key)
+                self.process_show(show_key, section_title, section_type)
                 
             elif section_type == "artist":
                 # For music, we need to get all albums and tracks
                 artist_key = item.get("key")
-                self.process_artist(artist_key)
+                self.process_artist(artist_key, section_title, section_type)
                 
             else:
                 # Handle other media types
@@ -132,12 +164,15 @@ class PlexMediaCalculator:
                     section_duration += duration
                     section_count += 1
                     self.media_counts["other"] += 1
+                    self.library_stats[section_title]["count"] += 1
+                    self.library_stats[section_title]["duration"] += duration
+                    self.library_stats[section_title]["type"] = section_type
         
         if section_type == "movie":
             self.total_duration += section_duration
             print(f"  Found {section_count} movies with total duration: {self.format_duration(section_duration)}")
     
-    def process_show(self, show_key):
+    def process_show(self, show_key, section_title, section_type):
         """Process a TV show and all its episodes"""
         data = self.make_request(show_key)
         if not data:
@@ -147,9 +182,9 @@ class PlexMediaCalculator:
         seasons = data.get("MediaContainer", {}).get("Metadata", [])
         for season in seasons:
             season_key = season.get("key")
-            self.process_season(season_key)
+            self.process_season(season_key, section_title, section_type)
     
-    def process_season(self, season_key):
+    def process_season(self, season_key, section_title, section_type):
         """Process a TV season and all its episodes"""
         data = self.make_request(season_key)
         if not data:
@@ -162,8 +197,11 @@ class PlexMediaCalculator:
             if duration:
                 self.total_duration += duration
                 self.media_counts["episodes"] += 1
+                self.library_stats[section_title]["count"] += 1
+                self.library_stats[section_title]["duration"] += duration
+                self.library_stats[section_title]["type"] = section_type
     
-    def process_artist(self, artist_key):
+    def process_artist(self, artist_key, section_title, section_type):
         """Process a music artist and all their tracks"""
         data = self.make_request(artist_key)
         if not data:
@@ -173,9 +211,9 @@ class PlexMediaCalculator:
         albums = data.get("MediaContainer", {}).get("Metadata", [])
         for album in albums:
             album_key = album.get("key")
-            self.process_album(album_key)
+            self.process_album(album_key, section_title, section_type)
     
-    def process_album(self, album_key):
+    def process_album(self, album_key, section_title, section_type):
         """Process a music album and all its tracks"""
         data = self.make_request(album_key)
         if not data:
@@ -188,6 +226,9 @@ class PlexMediaCalculator:
             if duration:
                 self.total_duration += duration
                 self.media_counts["tracks"] += 1
+                self.library_stats[section_title]["count"] += 1
+                self.library_stats[section_title]["duration"] += duration
+                self.library_stats[section_title]["type"] = section_type
     
     def calculate_total_duration(self):
         """Calculate the total duration of all media in the Plex server"""
@@ -210,15 +251,49 @@ class PlexMediaCalculator:
     
     def print_summary(self):
         """Print a summary of all media and their total duration"""
-        print("\n=== MEDIA LIBRARY SUMMARY ===")
-        print(f"Movies: {self.media_counts['movies']}")
-        print(f"TV Episodes: {self.media_counts['episodes']}")
-        print(f"Music Tracks: {self.media_counts['tracks']}")
-        print(f"Other Media: {self.media_counts['other']}")
-        print(f"Total Items: {sum(self.media_counts.values())}")
+        if TABULATE_AVAILABLE:
+            if self.group_by == "type":
+                table = [
+                    ["Movies", self.media_counts["movies"]],
+                    ["TV Episodes", self.media_counts["episodes"]],
+                    ["Music Tracks", self.media_counts["tracks"]],
+                    ["Other Media", self.media_counts["other"]],
+                    ["Total", sum(self.media_counts.values())]
+                ]
+                print("\n=== MEDIA LIBRARY SUMMARY (by Type) ===")
+                print(tabulate(table, headers=["Category", "Count"], tablefmt="github"))
+            else:
+                table = []
+                total = 0
+                for lib, stats in self.library_stats.items():
+                    table.append([lib, stats["type"], stats["count"], self.format_duration(stats["duration"])])
+                    total += stats["count"]
+                table.append(["Total", "", total, ""])
+                print("\n=== MEDIA LIBRARY SUMMARY (by Library Name) ===")
+                print(tabulate(table, headers=["Library Name", "Type", "Count", "Duration"], tablefmt="github"))
+        else:
+            # Fallback: use string formatting for a readable table
+            if self.group_by == "type":
+                print("\n=== MEDIA LIBRARY SUMMARY (by Type) ===")
+                print(f"{'Category':<15} {'Count':>10}")
+                print("-" * 27)
+                print(f"{'Movies':<15} {self.media_counts['movies']:>10}")
+                print(f"{'TV Episodes':<15} {self.media_counts['episodes']:>10}")
+                print(f"{'Music Tracks':<15} {self.media_counts['tracks']:>10}")
+                print(f"{'Other Media':<15} {self.media_counts['other']:>10}")
+                print("-" * 27)
+                print(f"{'Total':<15} {sum(self.media_counts.values()):>10}")
+            else:
+                print("\n=== MEDIA LIBRARY SUMMARY (by Library Name) ===")
+                print(f"{'Library Name':<25} {'Type':<10} {'Count':>8} {'Duration':>20}")
+                print("-" * 65)
+                total = 0
+                for lib, stats in self.library_stats.items():
+                    print(f"{lib:<25} {stats['type']:<10} {stats['count']:>8} {self.format_duration(stats['duration']):>20}")
+                    total += stats['count']
+                print("-" * 65)
+                print(f"{'Total':<25} {'':<10} {total:>8}")
         print("\n=== TOTAL DURATION ===")
-        
-        # Convert to more understandable units
         total_seconds = self.total_duration / 1000
         days = total_seconds // 86400
         remaining = total_seconds % 86400
@@ -226,16 +301,13 @@ class PlexMediaCalculator:
         remaining %= 3600
         minutes = remaining // 60
         seconds = remaining % 60
-        
         print(f"Total Duration: {self.format_duration(self.total_duration)}")
         print(f"That's approximately {int(days)} days, {int(hours)} hours, {int(minutes)} minutes, and {int(seconds)} seconds of content!")
-        
         if days > 0:
             print(f"\nIf you watched/listened 8 hours per day:")
             continuous_days = days + (hours / 24) + (minutes / 1440) + (seconds / 86400)
             viewing_days = continuous_days * 3  # Assuming 8 hours per day (24/8 = 3)
             print(f"It would take you about {int(viewing_days)} days to go through your entire library.")
-        
         print("\nThank you for using Plex Media Calculator!")
 
 def main():
